@@ -930,10 +930,13 @@ async def phase3_database(output: Path, state: State, elapsed: float) -> None:
 
 async def main(args: argparse.Namespace) -> int:
     cfg = MODES[args.mode]
-    output = Path(
-        args.output_dir or
-        f"Honorbuddy_ARCHIVE_{time.strftime('%Y%m%d_%H%M%S')}"
-    )
+
+    if not args.output_dir:
+        default_dir = f"Honorbuddy_ARCHIVE_{time.strftime('%Y%m%d_%H%M%S')}"
+        dir_input = input(f"\n{_ANSI['cyan']}Where would you like to save the archive? (Press Enter for default: {default_dir}): {_ANSI['reset']}").strip()
+        args.output_dir = dir_input if dir_input else default_dir
+
+    output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
 
     checkpoint = output / "checkpoint.json"
@@ -956,8 +959,13 @@ async def main(args: argparse.Namespace) -> int:
         state = State()
 
     if not args.github_token:
-        log.warning("  No GitHub token — expect API rate-limiting (10 req/min)")
-        log.warning("  Tip: export GITHUB_TOKEN=ghp_xxxx  or --github-token")
+        print(f"\n{_ANSI['yellow']}No GitHub token provided. You will likely be rate-limited.{_ANSI['reset']}")
+        token_input = input(f"{_ANSI['cyan']}Please enter your GitHub token (or press Enter to skip): {_ANSI['reset']}").strip()
+        if token_input:
+            args.github_token = token_input
+            log.info("  GitHub token active — 5000 req/h unlocked")
+        else:
+            log.warning("  Proceeding without GitHub token — expect API rate-limiting (10 req/min)")
     else:
         log.info("  GitHub token active — 5000 req/h unlocked")
 

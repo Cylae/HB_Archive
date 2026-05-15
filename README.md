@@ -23,7 +23,9 @@ You don't need much to get started. Just clone this repository and make sure you
 
 ## 💻 Usage
 
-Running the script is super simple. For cross-platform compatibility, especially on Windows, use the `python` command:
+Running the script is super simple. It is now fully **interactive**! If you don't provide an output directory or a GitHub token via arguments, it will kindly prompt you for them.
+
+For cross-platform compatibility, especially on Windows, use the `python` command:
 
 ```bash
 python honorbuddy_archive.py --help

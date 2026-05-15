@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
 # ==============================================================================
 #  HONORBUDDY ARCHIVE SYSTEM — Final Edition
-#  Moteur Python async (aiohttp) — remplace les 3 scripts PowerShell originaux
+#  Async Python engine (aiohttp) — replaces the 3 original PowerShell scripts
 #
-#  Améliorations vs rewrite précédent :
-#    • Logging stdlib sync (pas de async log → overhead inutile éliminé)
-#    • BFS crawl propre par niveaux (file dédiée par profondeur)
-#    • Résumé/checkpoint réel (--resume charge l'état et saute le déjà fait)
-#    • Shutdown propre sur SIGINT (sauvegarde partielle)
-#    • Patterns regex compilés au module load (pas à chaque appel)
-#    • --skip-meshes présent (était dans README mais absent du code)
-#    • Téléchargements streamés + tmp-rename atomique
-#    • Déduplication agressive (normalisation URL avant insert)
-#    • Barre de progression en ligne (pas de flood console)
-#    • git clone : --depth=1 --no-tags, timeout 5 min
-#    • Auto-install deps si manquants
+#  Improvements vs previous rewrite:
+#    • Sync stdlib logging (no async log → useless overhead eliminated)
+#    • Clean BFS crawl by levels (dedicated queue per depth)
+#    • Real resume/checkpoint (--resume loads state and skips already done)
+#    • Clean shutdown on SIGINT (partial save)
+#    • Regex patterns compiled on module load (not on each call)
+#    • --skip-meshes present (was in README but missing from code)
+#    • Streamed downloads + atomic tmp-rename
+#    • Aggressive deduplication (URL normalization before insert)
+#    • Inline progress bar (no console flood)
+#    • git clone: --depth=1 --no-tags, timeout 5 min
+#    • Auto-install deps if missing
 # ==============================================================================
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ def _ensure_deps() -> None:
             missing.append(pkg)
     if missing:
         import subprocess
-        print(f"[SETUP] Installation : {', '.join(missing)}")
+        print(f"[SETUP] Installation: {', '.join(missing)}")
         subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", *missing])
 
 _ensure_deps()
@@ -124,7 +124,7 @@ def progress(done: int, total: int, label: str = "") -> None:
         print()
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  CONSTANTES & CONFIGURATION
+#  CONSTANTS & CONFIGURATION
 # ══════════════════════════════════════════════════════════════════════════════
 
 MODES: Dict[str, dict] = {
@@ -132,19 +132,19 @@ MODES: Dict[str, dict] = {
         "crawl_depth": 3, "retries": 3, "timeout": 30,
         "max_per_search": 100,
         "sem_search": 25, "sem_download": 20, "sem_clone": 5,
-        "desc": "Archive complète — équilibré (~20-40 min)",
+        "desc": "Complete archive — balanced (~20-40 min)",
     },
     "aggressive": {
         "crawl_depth": 5, "retries": 4, "timeout": 45,
         "max_per_search": 150,
         "sem_search": 40, "sem_download": 30, "sem_clone": 8,
-        "desc": "Couverture max (~40-70 min)",
+        "desc": "Max coverage (~40-70 min)",
     },
     "ultimate": {
         "crawl_depth": 7, "retries": 5, "timeout": 60,
         "max_per_search": 200,
         "sem_search": 60, "sem_download": 40, "sem_clone": 10,
-        "desc": "TOUT — aucune pierre non retournée (~70-120 min)",
+        "desc": "EVERYTHING — leave no stone unturned (~70-120 min)",
     },
 }
 
@@ -186,9 +186,9 @@ PRIVATE_SERVERS = [
     {"name": "Tauri",     "type": "MOP"},
 ]
 
-# ─── Patterns compilés une fois au chargement du module ──────────────────────
+# ─── Patterns compiled once at module load ───────────────────────────────────
 
-# Scoring de pertinence : (pattern compilé, poids)
+# Relevance scoring: (compiled pattern, weight)
 _SCORE_PATS: List[Tuple[re.Pattern, int]] = [
     (re.compile(r"honorbuddy",                                             re.I), 100),
     (re.compile(r"hb\d+",                                                  re.I),  80),
@@ -211,7 +211,7 @@ _SANITIZE_RE = re.compile(r'[<>:"/\\|?*=&%\x00-\x1f]+')
 _DL_RE       = re.compile(r'\.(zip|7z|rar|exe|hbs|lua|xml)(?:[?#]|$)|\.git(?:/|$)', re.I)
 _GIT_RE      = re.compile(r'\.git(?:/|$)|github\.com/[^/]+/[^/?#]+(?:\.git)?$', re.I)
 
-# Pattern de détection de version par code WoW (compilé par version)
+# WoW code version detection pattern (compiled per version)
 _VER_PATS: List[Tuple[WoWVersion, re.Pattern]] = []
 for _v in WOW_VERSIONS:
     _parts = (
@@ -244,7 +244,7 @@ class Asset:
 
 @dataclass
 class State:
-    """Checkpoint complet — sérialisable en JSON."""
+    """Complete checkpoint — serializable to JSON."""
     phase:     int             = 0
     assets:    Dict[str, dict] = field(default_factory=dict)
     crawled:   Set[str]        = field(default_factory=set)
@@ -308,7 +308,7 @@ def safe_name(raw: str, fallback: str = "file") -> str:
     return (n[:200] if n else f"{fallback}_{random.randint(10000,99999)}.bin")
 
 def normalize_url(url: str) -> str:
-    """Normalise pour déduplication : strip trailing /, query, fragment."""
+    """Normalizes for deduplication: strips trailing /, query, fragment."""
     try:
         p = urlparse(url)
         return urlunparse((p.scheme.lower(), p.netloc.lower(), p.path.rstrip("/"), "", "", ""))
@@ -338,15 +338,15 @@ def extract_links(html: str, base_url: str) -> List[str]:
 
 class Http:
     """
-    Session aiohttp partagée :
-      - Pool global + per-host limits
-      - Semaphore par domaine (rate-limit précis)
-      - Retry exponentiel + jitter
+    Shared aiohttp session:
+      - Global pool + per-host limits
+      - Semaphore per domain (precise rate-limit)
+      - Exponential retry + jitter
       - User-Agent rotation
-      - Download streamé chunk-by-chunk, rename atomique
+      - Streamed download chunk-by-chunk, atomic rename
     """
 
-    # Limites de concurrence spécifiques par host
+    # Concurrency limits specific per host
     _HOST_LIMITS = {
         "api.github.com":   2,
         "archive.org":      4,
@@ -359,7 +359,7 @@ class Http:
         self._gh_token = gh_token
         self._conn: Optional[aiohttp.TCPConnector] = None
         self._session: Optional[aiohttp.ClientSession] = None
-        # Semaphores créés dans __aenter__ (nécessite un event loop actif)
+        # Semaphores created in __aenter__ (requires an active event loop)
         self._sems: Optional[Dict[str, asyncio.Semaphore]] = None
 
     async def __aenter__(self) -> "Http":
@@ -565,8 +565,8 @@ async def phase0_discovery(
     state: State,
 ) -> None:
     log.info("━" * 62)
-    log.info("  PHASE 0 : DÉCOUVERTE PARALLÈLE")
-    log.info(f"  {len(queries)} requêtes — concurrence {sem_search}")
+    log.info("  PHASE 0 : PARALLEL DISCOVERY")
+    log.info(f"  {len(queries)} queries — concurrency {sem_search}")
     log.info("━" * 62)
 
     sem   = asyncio.Semaphore(sem_search)
@@ -605,7 +605,7 @@ async def phase0_discovery(
         if isinstance(result, list):
             buf.extend(result)
 
-    # Déduplique et insère dans l'état
+    # Deduplicate and insert into state
     added = 0
     for a in buf:
         key = normalize_url(a.url)
@@ -614,27 +614,27 @@ async def phase0_discovery(
             known.add(key)
             added += 1
 
-    log.success(f"  Discovery : {added} nouvelles cibles ({len(state.assets)} total)")  # type: ignore[attr-defined]
+    log.success(f"  Discovery : {added} new targets ({len(state.assets)} total)")  # type: ignore[attr-defined]
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  PHASE 1 — CRAWL BFS PAR NIVEAUX
+#  PHASE 1 — CRAWL BFS BY LEVELS
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def _crawl_one(http: Http, url: str, min_link_score: int = 15) -> Tuple[str, str, List[str]]:
     """
-    Crawl une URL HTML.
-    Retourne (url, content_head, new_links).
-    Ne tente pas de fetcher des .git ou fichiers binaires.
+    Crawls an HTML URL.
+    Returns (url, content_head, new_links).
+    Does not attempt to fetch .git or binary files.
     """
     if _DL_RE.search(url):
-        return url, "", []  # Directement téléchargeable, pas besoin de crawler
+        return url, "", []  # Directly downloadable, no need to crawl
 
     raw = await http.get(url, max_bytes=200_000)
     if not raw:
         return url, "", []
 
     head    = raw[:5_000]
-    # Filtre: page doit contenir au moins un terme Honorbuddy pour valoir le crawl
+    # Filter: page must contain at least one Honorbuddy term to be worth crawling
     if not re.search(r"honorbuddy|hbrelog|singular|navmesh|hbmeshes", raw, re.I):
         return url, "", []
 
@@ -655,10 +655,10 @@ async def phase1_crawl(
 ) -> None:
     log.info("━" * 62)
     log.info("  PHASE 1 : CRAWL BFS")
-    log.info(f"  {len(state.assets)} URLs — profondeur max {max_depth} — concurrence {sem_crawl}")
+    log.info(f"  {len(state.assets)} URLs — max depth {max_depth} — concurrency {sem_crawl}")
     log.info("━" * 62)
 
-    # File BFS : toutes les URLs de l'état non encore crawlées
+    # BFS Queue: all un-crawled URLs from the state
     sem    = asyncio.Semaphore(sem_crawl)
     known  = set(state.assets.keys())
 
@@ -671,7 +671,7 @@ async def phase1_crawl(
         if not current_level:
             break
 
-        log.info(f"  Profondeur {depth}/{max_depth} — {len(current_level)} URLs")
+        log.info(f"  Depth {depth}/{max_depth} — {len(current_level)} URLs")
 
         async def _bounded(url: str):
             async with sem:
@@ -690,7 +690,7 @@ async def phase1_crawl(
             url, head, new_links = res
             state.crawled.add(normalize_url(url))
 
-            # Enrichir l'asset avec contenu
+            # Enrich asset with content
             norm = normalize_url(url)
             if norm in state.assets:
                 a = Asset.from_dict(state.assets[norm])
@@ -702,7 +702,7 @@ async def phase1_crawl(
                     a.score = max(a.score, score(url, head))
                 state.assets[norm] = a.to_dict()
 
-            # Nouveaux liens à crawler
+            # New links to crawl
             for link in new_links:
                 nkey = normalize_url(link)
                 if nkey not in known:
@@ -714,13 +714,13 @@ async def phase1_crawl(
                     if not _GIT_RE.search(link):
                         next_level.append(nkey)
 
-        log.info(f"  → {len(state.assets)} assets, {len(next_level)} nouveaux links")
-        # Checkpoint intermédiaire après chaque niveau
+        log.info(f"  → {len(state.assets)} assets, {len(next_level)} new links")
+        # Intermediate checkpoint after each level
         state.phase = 1
         state.save(checkpoint_path)
         current_level = next_level
 
-    # Enrichissement final : types/versions depuis URL seule pour les non-crawlés
+    # Final enrichment: types/versions from URL alone for non-crawled
     for key, d in state.assets.items():
         a = Asset.from_dict(d)
         if a.asset_type in ("Unknown", ""):
@@ -729,7 +729,7 @@ async def phase1_crawl(
             a.versions = detect_versions(a.url)
         state.assets[key] = a.to_dict()
 
-    log.success(f"  Crawl terminé — {len(state.assets)} assets structurés")  # type: ignore[attr-defined]
+    log.success(f"  Crawl finished — {len(state.assets)} structured assets")  # type: ignore[attr-defined]
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  PHASE 2 — ACQUISITION
@@ -757,7 +757,7 @@ async def _git_clone(url: str, dest: Path, sem: asyncio.Semaphore) -> bool:
 
 
 def _build_dest(output: Path, a: Asset) -> Path:
-    """Construit le chemin de destination en fonction de la version et du type."""
+    """Builds destination path based on version and type."""
     versions = a.versions or ["Unknown"]
     v_obj = next((v for v in WOW_VERSIONS if v.name in versions), None)
     ver_dir = (
@@ -824,7 +824,7 @@ async def phase2_download(
     checkpoint_path: Path,
 ) -> int:
     log.info("━" * 62)
-    log.info("  PHASE 2 : ACQUISITION PARALLÈLE")
+    log.info("  PHASE 2 : PARALLEL ACQUISITION")
     log.info("━" * 62)
 
     candidates = [
@@ -833,7 +833,7 @@ async def phase2_download(
         and normalize_url(d["url"]) not in state.downloaded
     ]
     candidates.sort(key=lambda a: a.score, reverse=True)
-    log.info(f"  {len(candidates)} assets éligibles (score ≥ {min_score})")
+    log.info(f"  {len(candidates)} eligible assets (score ≥ {min_score})")
 
     dl_sem  = asyncio.Semaphore(sem_download)
     git_sem = asyncio.Semaphore(sem_clone)
@@ -844,16 +844,16 @@ async def phase2_download(
         return_exceptions=True,
     )
     count = sum(1 for r in results if r is True)
-    log.success(f"  Acquisition : {count}/{len(candidates)} objets sécurisés")  # type: ignore[attr-defined]
+    log.success(f"  Acquisition : {count}/{len(candidates)} objects secured")  # type: ignore[attr-defined]
     return count
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  PHASE 3 — BASE DE DONNÉES DUAL-FORMAT
+#  PHASE 3 — DUAL-FORMAT DATABASE
 # ══════════════════════════════════════════════════════════════════════════════
 
 async def phase3_database(output: Path, state: State, elapsed: float) -> None:
     log.info("━" * 62)
-    log.info("  PHASE 3 : GÉNÉRATION BASE DE DONNÉES")
+    log.info("  PHASE 3 : DATABASE GENERATION")
     log.info("━" * 62)
 
     assets   = [Asset.from_dict(d) for d in state.assets.values()]
@@ -871,8 +871,8 @@ async def phase3_database(output: Path, state: State, elapsed: float) -> None:
     async with aiofiles.open(txt, "w", encoding="utf-8") as f:
         await f.write("=" * 78 + "\n")
         await f.write("        HONORBUDDY MASTER INDEX\n")
-        await f.write(f"        Généré le {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-        await f.write(f"        Durée : {m}m {s}s | Assets : {len(assets)}\n")
+        await f.write(f"        Generated on {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        await f.write(f"        Duration: {m}m {s}s | Assets: {len(assets)}\n")
         await f.write("=" * 78 + "\n\n")
 
         for ver in sorted(by_ver.keys()):
@@ -882,7 +882,7 @@ async def phase3_database(output: Path, state: State, elapsed: float) -> None:
                 by_t[a.asset_type].append(a)
             await f.write(f"\n{'─'*78}\n{ver} ({len(ver_assets)} assets)\n{'─'*78}\n")
             for atype, group in sorted(by_t.items()):
-                await f.write(f"  [{atype}] — {len(group)} fichiers\n")
+                await f.write(f"  [{atype}] — {len(group)} files\n")
                 for a in sorted(group, key=lambda x: x.score, reverse=True):
                     await f.write(f"    • {a.title or a.url}\n")
                     await f.write(f"      URL    : {a.url}\n")
@@ -911,12 +911,12 @@ async def phase3_database(output: Path, state: State, elapsed: float) -> None:
     # ── STATS ─────────────────────────────────────────────────────────────────
     stats = output / "STATS.txt"
     async with aiofiles.open(stats, "w", encoding="utf-8") as f:
-        await f.write(f"HonorbuddyArchive — Statistiques\n")
-        await f.write(f"Généré le {time.strftime('%Y-%m-%d %H:%M:%S')} — Durée {m}m {s}s\n\n")
-        await f.write("PAR TYPE :\n")
+        await f.write(f"HonorbuddyArchive — Statistics\n")
+        await f.write(f"Generated on {time.strftime('%Y-%m-%d %H:%M:%S')} — Duration {m}m {s}s\n\n")
+        await f.write("BY TYPE:\n")
         for t, c in sorted(by_type.items(), key=lambda x: -x[1]):
             await f.write(f"  {t:<20} {c:>5}\n")
-        await f.write("\nPAR VERSION :\n")
+        await f.write("\nBY VERSION:\n")
         for ver, lst in sorted(by_ver.items()):
             await f.write(f"  {ver:<30} {len(lst):>5}\n")
         await f.write(f"\nTOTAL : {len(assets)}\n")
@@ -944,30 +944,30 @@ async def main(args: argparse.Namespace) -> int:
     ew = 62
     print(f"{_ANSI['mag']}╔{'═'*ew}╗")
     print(f"║{'HONORBUDDY ARCHIVE — Final Edition':^{ew}}║")
-    print(f"║{'Mode : ' + args.mode + '  ' + cfg['desc']:^{ew}}║")
+    print(f"║{'Mode: ' + args.mode + '  ' + cfg['desc']:^{ew}}║")
     print(f"╚{'═'*ew}╝{_ANSI['reset']}\n")
 
-    # ── Reprise ou nouveau départ ─────────────────────────────────────────────
+    # ── Resume or new start ───────────────────────────────────────────────────
     if args.resume and checkpoint.exists():
-        log.info("  Reprise depuis checkpoint...")
+        log.info("  Resuming from checkpoint...")
         state = State.load(checkpoint)
-        log.info(f"  {len(state.assets)} assets, {len(state.downloaded)} déjà téléchargés")
+        log.info(f"  {len(state.assets)} assets, {len(state.downloaded)} already downloaded")
     else:
         state = State()
 
     if not args.github_token:
-        log.warning("  Aucun token GitHub — rate-limit API attendu (10 req/min)")
-        log.warning("  Conseil : export GITHUB_TOKEN=ghp_xxxx  ou --github-token")
+        log.warning("  No GitHub token — expect API rate-limiting (10 req/min)")
+        log.warning("  Tip: export GITHUB_TOKEN=ghp_xxxx  or --github-token")
     else:
-        log.info("  Token GitHub actif — 5000 req/h débloqués")
+        log.info("  GitHub token active — 5000 req/h unlocked")
 
     t0 = time.time()
 
-    # ── Gestion Ctrl+C ────────────────────────────────────────────────────────
+    # ── Handle Ctrl+C ─────────────────────────────────────────────────────────
     _shutdown = asyncio.Event()
 
     def _sigint(*_):
-        log.warning("\n  [SIGINT] Arrêt demandé — sauvegarde en cours...")
+        log.warning("\n  [SIGINT] Stop requested — saving in progress...")
         _shutdown.set()
 
     try:
@@ -985,7 +985,7 @@ async def main(args: argparse.Namespace) -> int:
                 include_private=not args.skip_private,
                 include_meshes=not args.skip_meshes,
             )
-            log.info(f"  {len(queries)} patterns de recherche compilés")
+            log.info(f"  {len(queries)} search patterns compiled")
             await phase0_discovery(http, queries, cfg["max_per_search"],
                                    cfg["sem_search"], state)
             state.phase = 1
@@ -1012,7 +1012,7 @@ async def main(args: argparse.Namespace) -> int:
                                    cfg["sem_download"], cfg["sem_clone"],
                                    state, checkpoint)
         else:
-            log.warning("  Téléchargements ignorés (--skip-download)")
+            log.warning("  Downloads skipped (--skip-download)")
 
         if _shutdown.is_set():
             state.save(checkpoint)
@@ -1022,14 +1022,14 @@ async def main(args: argparse.Namespace) -> int:
     elapsed = time.time() - t0
     await phase3_database(output, state, elapsed)
 
-    # ── Résumé final ──────────────────────────────────────────────────────────
+    # ── Final resume ──────────────────────────────────────────────────────────
     m, s = divmod(int(elapsed), 60)
     print(f"\n{_ANSI['green']}╔{'═'*ew}╗")
-    print(f"║{'ARCHIVAGE TERMINÉ':^{ew}}║")
+    print(f"║{'ARCHIVING COMPLETE':^{ew}}║")
     print(f"╚{'═'*ew}╝{_ANSI['reset']}")
-    log.success(f"  Durée         : {m}m {s}s")  # type: ignore[attr-defined]
+    log.success(f"  Duration      : {m}m {s}s")  # type: ignore[attr-defined]
     log.success(f"  Assets        : {len(state.assets)}")  # type: ignore[attr-defined]
-    log.success(f"  Sécurisés     : {len(state.downloaded)}")  # type: ignore[attr-defined]
+    log.success(f"  Secured       : {len(state.downloaded)}")  # type: ignore[attr-defined]
     log.info(f"  Vault         : {output.resolve()}")
     log.info(f"  Checkpoint    : {checkpoint}")
     return 0
@@ -1046,20 +1046,20 @@ def _parser() -> argparse.ArgumentParser:
         epilog="\n".join(f"  {m:<12} {c['desc']}" for m, c in MODES.items()),
     )
     p.add_argument("--mode",         choices=list(MODES), default="standard",
-                   help="Mode d'archivage")
+                   help="Archive mode")
     p.add_argument("--output-dir",   default=None,
-                   help="Répertoire de sortie (défaut : auto-daté)")
+                   help="Output directory (default: auto-dated)")
     p.add_argument("--github-token", default=os.environ.get("GITHUB_TOKEN", ""),
-                   metavar="TOKEN", help="Token GitHub API (ou var GITHUB_TOKEN)")
+                   metavar="TOKEN", help="GitHub API Token (or GITHUB_TOKEN env var)")
     p.add_argument("--min-score",    type=int, default=20,
-                   help="Score de pertinence minimum pour télécharger (défaut : 20)")
-    p.add_argument("--skip-private", action="store_true", help="Exclure les serveurs privés")
-    p.add_argument("--skip-addons",  action="store_true", help="Exclure les addons")
-    p.add_argument("--skip-meshes",  action="store_true", help="Exclure les meshes")
-    p.add_argument("--skip-crawl",   action="store_true", help="Désactiver le crawl profond")
-    p.add_argument("--skip-download",action="store_true", help="Discovery + mapping seulement")
+                   help="Minimum relevance score to download (default: 20)")
+    p.add_argument("--skip-private", action="store_true", help="Exclude private servers")
+    p.add_argument("--skip-addons",  action="store_true", help="Exclude addons")
+    p.add_argument("--skip-meshes",  action="store_true", help="Exclude meshes")
+    p.add_argument("--skip-crawl",   action="store_true", help="Disable deep crawl")
+    p.add_argument("--skip-download",action="store_true", help="Discovery + mapping only")
     p.add_argument("--resume",       action="store_true",
-                   help="Reprendre depuis le checkpoint existant dans --output-dir")
+                   help="Resume from existing checkpoint in --output-dir")
     return p
 
 

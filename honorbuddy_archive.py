@@ -38,7 +38,7 @@ from urllib.parse import quote, urlparse, urlunparse
 # ─── Deps ────────────────────────────────────────────────────────────────────
 def _ensure_deps() -> None:
     missing = []
-    for pkg in ("aiohttp", "aiofiles"):
+    for pkg in ("aiohttp", "aiofiles", "rich"):
         try:
             __import__(pkg)
         except ImportError:
@@ -52,35 +52,14 @@ _ensure_deps()
 
 import aiohttp      # noqa: E402
 import aiofiles     # type: ignore # noqa: E402
+import rich         # type: ignore # noqa: E402
+from rich.console import Console # type: ignore # noqa: E402
+from rich.prompt import Prompt # type: ignore # noqa: E402
+from rich.logging import RichHandler # type: ignore # noqa: E402
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeRemainingColumn # type: ignore # noqa: E402
 
-try:
-    import colorama # type: ignore
-    colorama.init(autoreset=True)
-except ImportError:
-    pass
-
-# ─── Logging ─────────────────────────────────────────────────────────────────
-_ANSI = {
-    "reset": "\033[0m", "bold": "\033[1m",
-    "cyan":  "\033[96m", "green":  "\033[92m",
-    "yellow":"\033[93m", "red":    "\033[91m",
-    "mag":   "\033[95m", "gray":   "\033[90m",
-}
-
-class _Fmt(logging.Formatter):
-    _MAP = {
-        logging.DEBUG:    _ANSI["gray"],
-        logging.INFO:     _ANSI["cyan"],
-        logging.WARNING:  _ANSI["yellow"],
-        logging.ERROR:    _ANSI["red"],
-        logging.CRITICAL: _ANSI["mag"],
-    }
-    _SUCCESS = 25
-    def format(self, r: logging.LogRecord) -> str:
-        lvl = r.levelname[:7].ljust(7)
-        col = self._MAP.get(r.levelno, "")
-        ts  = time.strftime("%H:%M:%S")
-        return f"{col}[{ts}] [{lvl}] {r.getMessage()}{_ANSI['reset']}"
+# ─── Rich Console & Logging ──────────────────────────────────────────────────
+console = Console()
 
 logging.addLevelName(25, "SUCCESS")
 
@@ -93,10 +72,15 @@ logging.Logger.success = _success  # type: ignore[attr-defined]
 def setup_logging(log_file: Optional[Path] = None) -> logging.Logger:
     logger = logging.getLogger("hba")
     logger.setLevel(logging.DEBUG)
-    ch = logging.StreamHandler(sys.stdout)
+
+    # Use RichHandler for pretty console logs
+    ch = RichHandler(console=console, rich_tracebacks=True, show_time=True, show_path=False)
     ch.setLevel(logging.INFO)
-    ch.setFormatter(_Fmt())
+
+    # Add custom formatting for log level styles
+    logging.getLogger("rich").setLevel(logging.WARNING)
     logger.addHandler(ch)
+
     if log_file:
         fh = logging.FileHandler(log_file, encoding="utf-8")
         fh.setLevel(logging.DEBUG)
@@ -106,22 +90,6 @@ def setup_logging(log_file: Optional[Path] = None) -> logging.Logger:
 
 log = logging.getLogger("hba")
 
-# ─── Progress bar (in-place, non-spammy) ─────────────────────────────────────
-_last_pct = -1
-
-def progress(done: int, total: int, label: str = "") -> None:
-    global _last_pct
-    if total == 0:
-        return
-    pct = int(done / total * 100)
-    if pct == _last_pct:
-        return
-    _last_pct = pct
-    bar = ("█" * (pct // 5)).ljust(20)
-    print(f"\r  {_ANSI['cyan']}[{bar}] {pct:3d}% {done}/{total}  {label:<30}{_ANSI['reset']}",
-          end="", flush=True)
-    if done >= total:
-        print()
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  CONSTANTS & CONFIGURATION
@@ -595,15 +563,22 @@ async def phase0_discovery(
         tasks.append(loop.create_task(_run(_wayback(http, d))))
 
     total = len(tasks)
-    done  = 0
     buf: List[Asset] = []
 
-    for coro in asyncio.as_completed(tasks):
-        result = await coro
-        done  += 1
-        progress(done, total, "Discovery")
-        if isinstance(result, list):
-            buf.extend(result)
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeRemainingColumn(),
+        console=console
+    ) as progress:
+        task_id = progress.add_task("[cyan]Discovery...", total=total)
+        for coro in asyncio.as_completed(tasks):
+            result = await coro
+            progress.advance(task_id)
+            if isinstance(result, list):
+                buf.extend(result)
 
     # Deduplicate and insert into state
     added = 0
@@ -677,10 +652,21 @@ async def phase1_crawl(
             async with sem:
                 return await _crawl_one(http, url)
 
-        results = await asyncio.gather(
-            *[_bounded(u) for u in current_level],
-            return_exceptions=True,
-        )
+        results = []
+        with Progress(
+            SpinnerColumn(),
+            TextColumn(f"[progress.description]Crawling depth {depth}..."),
+            BarColumn(),
+            TaskProgressColumn(),
+            TimeRemainingColumn(),
+            console=console
+        ) as progress:
+            task_id = progress.add_task("crawl", total=len(current_level))
+            futs = [_bounded(u) for u in current_level]
+            for fut in asyncio.as_completed(futs):
+                res = await fut
+                results.append(res)
+                progress.advance(task_id)
 
         next_level: List[str] = []
 
@@ -838,11 +824,22 @@ async def phase2_download(
     dl_sem  = asyncio.Semaphore(sem_download)
     git_sem = asyncio.Semaphore(sem_clone)
 
-    results = await asyncio.gather(
-        *[_download_one(http, a, output, dl_sem, git_sem, state, checkpoint_path)
-          for a in candidates],
-        return_exceptions=True,
-    )
+    results = []
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]Downloading assets..."),
+        BarColumn(),
+        TaskProgressColumn(),
+        TimeRemainingColumn(),
+        console=console
+    ) as progress:
+        task_id = progress.add_task("dl", total=len(candidates))
+        futs = [_download_one(http, a, output, dl_sem, git_sem, state, checkpoint_path) for a in candidates]
+        for fut in asyncio.as_completed(futs):
+            res = await fut
+            results.append(res)
+            progress.advance(task_id)
+
     count = sum(1 for r in results if r is True)
     log.success(f"  Acquisition : {count}/{len(candidates)} objects secured")  # type: ignore[attr-defined]
     return count
@@ -933,8 +930,11 @@ async def main(args: argparse.Namespace) -> int:
 
     if not args.output_dir:
         default_dir = f"Honorbuddy_ARCHIVE_{time.strftime('%Y%m%d_%H%M%S')}"
-        dir_input = input(f"\n{_ANSI['cyan']}Where would you like to save the archive? (Press Enter for default: {default_dir}): {_ANSI['reset']}").strip()
-        args.output_dir = dir_input if dir_input else default_dir
+        dir_input = Prompt.ask(
+            "\n[cyan]Where would you like to save the archive?[/]",
+            default=default_dir
+        ).strip()
+        args.output_dir = dir_input
 
     output = Path(args.output_dir)
     output.mkdir(parents=True, exist_ok=True)
@@ -944,11 +944,10 @@ async def main(args: argparse.Namespace) -> int:
     setup_logging(log_file)
 
     # ── Banner ────────────────────────────────────────────────────────────────
-    ew = 62
-    print(f"{_ANSI['mag']}╔{'═'*ew}╗")
-    print(f"║{'HONORBUDDY ARCHIVE — Final Edition':^{ew}}║")
-    print(f"║{'Mode: ' + args.mode + '  ' + cfg['desc']:^{ew}}║")
-    print(f"╚{'═'*ew}╝{_ANSI['reset']}\n")
+    console.print(f"[bold magenta]╔{'═'*62}╗[/]")
+    console.print(f"[bold magenta]║{'HONORBUDDY ARCHIVE — Final Edition':^62}║[/]")
+    console.print(f"[bold magenta]║{'Mode: ' + args.mode + '  ' + cfg['desc']:^62}║[/]")
+    console.print(f"[bold magenta]╚{'═'*62}╝[/]\n")
 
     # ── Resume or new start ───────────────────────────────────────────────────
     if args.resume and checkpoint.exists():
@@ -959,8 +958,12 @@ async def main(args: argparse.Namespace) -> int:
         state = State()
 
     if not args.github_token:
-        print(f"\n{_ANSI['yellow']}No GitHub token provided. You will likely be rate-limited.{_ANSI['reset']}")
-        token_input = input(f"{_ANSI['cyan']}Please enter your GitHub token (or press Enter to skip): {_ANSI['reset']}").strip()
+        console.print("\n[yellow]No GitHub token provided. You will likely be rate-limited.[/]")
+        token_input = Prompt.ask(
+            "[cyan]Please enter your GitHub token (or press Enter to skip)[/]",
+            default="",
+            show_default=False
+        ).strip()
         if token_input:
             args.github_token = token_input
             log.info("  GitHub token active — 5000 req/h unlocked")
@@ -1032,9 +1035,9 @@ async def main(args: argparse.Namespace) -> int:
 
     # ── Final resume ──────────────────────────────────────────────────────────
     m, s = divmod(int(elapsed), 60)
-    print(f"\n{_ANSI['green']}╔{'═'*ew}╗")
-    print(f"║{'ARCHIVING COMPLETE':^{ew}}║")
-    print(f"╚{'═'*ew}╝{_ANSI['reset']}")
+    console.print(f"\n[bold green]╔{'═'*62}╗[/]")
+    console.print(f"[bold green]║{'ARCHIVING COMPLETE':^62}║[/]")
+    console.print(f"[bold green]╚{'═'*62}╝[/]")
     log.success(f"  Duration      : {m}m {s}s")  # type: ignore[attr-defined]
     log.success(f"  Assets        : {len(state.assets)}")  # type: ignore[attr-defined]
     log.success(f"  Secured       : {len(state.downloaded)}")  # type: ignore[attr-defined]
